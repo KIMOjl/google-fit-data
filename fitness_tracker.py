@@ -5,11 +5,19 @@ Fetches fitness data from Google Fit API and generates summaries.
 """
 
 import json
+import os
+import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from env_utils import load_dotenv
 
-TOKEN_PATH = Path("/home/openclaw/.openclaw/workspace/.google_fit_tokens.json")
+load_dotenv()
+
+TOKEN_PATH = Path(os.environ.get("TOKEN_PATH", "credentials/google-fit-token.json"))
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+SLEEP_ACTIVITY_TYPE = 72
+SLEEP_STAGE_VALUES = {2, 4, 5, 6}
 
 def load_tokens():
     with open(TOKEN_PATH) as f:
@@ -23,20 +31,23 @@ def refresh_access_token(tokens):
     
     data = urllib.parse.urlencode({
         "refresh_token": refresh_token,
-        "client_id": os.environ.get("GOOGLE_CLIENT_ID", ""),
-        "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", ""),
+        "client_id": tokens.get("client_id") or os.environ.get("GOOGLE_CLIENT_ID", ""),
+        "client_secret": tokens.get("client_secret") or os.environ.get("GOOGLE_CLIENT_SECRET", ""),
         "grant_type": "refresh_token",
     }).encode()
     
-    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data, method="POST")
+    req = urllib.request.Request(tokens.get("token_uri", TOKEN_URI), data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     
     with urllib.request.urlopen(req) as resp:
         new_tokens = json.loads(resp.read())
-        # Preserve refresh token (not returned in refresh response)
-        new_tokens["refresh_token"] = refresh_token
+        # Preserve fields that are not returned in refresh responses.
+        for key in ("refresh_token", "client_id", "client_secret", "token_uri", "scopes"):
+            if tokens.get(key) and not new_tokens.get(key):
+                new_tokens[key] = tokens[key]
         
         # Save updated tokens
+        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(TOKEN_PATH, "w") as f:
             json.dump(new_tokens, f, indent=2)
         
@@ -47,6 +58,20 @@ def get_access_token():
     tokens = load_tokens()
     # For simplicity, we'll refresh proactively. In production, check expiry.
     return refresh_access_token(tokens)["access_token"]
+
+def to_utc(dt):
+    """Return a timezone-aware UTC datetime."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def to_millis(dt):
+    """Convert a datetime to Unix milliseconds."""
+    return int(to_utc(dt).timestamp() * 1000)
+
+def format_rfc3339(dt):
+    """Format a datetime for Google Fit session queries."""
+    return to_utc(dt).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 def query_fitness_data(access_token, start_time, end_time, data_types):
     """Query Google Fit for aggregated data."""
@@ -68,8 +93,8 @@ def query_fitness_data(access_token, start_time, end_time, data_types):
     body = {
         "aggregateBy": aggregate_by,
         "bucketByTime": {"durationMillis": 86400000},
-        "startTimeMillis": int(start_time.timestamp() * 1000),
-        "endTimeMillis": int(end_time.timestamp() * 1000),
+        "startTimeMillis": to_millis(start_time),
+        "endTimeMillis": to_millis(end_time),
     }
     
     req = urllib.request.Request(
@@ -93,15 +118,115 @@ def extract_value(point, value_type="intVal"):
     return None
 
 def parse_sleep_data(points):
-    """Parse sleep segments and calculate total sleep time."""
-    total_ms = 0
+    """Parse sleep stages and calculate total actual sleep time."""
+    intervals = []
     for point in points:
+        sleep_stage = extract_value(point, "intVal")
+        if sleep_stage not in SLEEP_STAGE_VALUES:
+            continue
         start = int(point["startTimeNanos"]) // 1_000_000
         end = int(point["endTimeNanos"]) // 1_000_000
-        total_ms += (end - start)
+        intervals.append((start, end))
     
-    hours = total_ms / (1000 * 60 * 60)
+    hours = total_interval_hours(intervals)
     return round(hours, 1)
+
+def total_interval_hours(intervals):
+    """Merge overlapping intervals and return the total duration in hours."""
+    if not intervals:
+        return 0
+
+    merged = []
+    for start, end in sorted(intervals):
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    total_ms = sum(end - start for start, end in merged)
+    return total_ms / (1000 * 60 * 60)
+
+def list_sleep_sessions(access_token, start_time, end_time):
+    """List Google Fit sleep sessions for the given UTC interval."""
+    sessions = []
+    page_token = None
+
+    while True:
+        params = {
+            "startTime": format_rfc3339(start_time),
+            "endTime": format_rfc3339(end_time),
+            "activityType": SLEEP_ACTIVITY_TYPE,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        url = "https://www.googleapis.com/fitness/v1/users/me/sessions?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {access_token}")
+
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+
+        sessions.extend(result.get("session", []))
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            return sessions
+
+def aggregate_sleep_session(access_token, session):
+    """Aggregate sleep segment details for a single Google Fit sleep session."""
+    start_ms = int(session["startTimeMillis"])
+    end_ms = int(session["endTimeMillis"])
+    body = {
+        "aggregateBy": [{"dataTypeName": "com.google.sleep.segment"}],
+        "startTimeMillis": start_ms,
+        "endTimeMillis": end_ms,
+    }
+
+    req = urllib.request.Request(
+        "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate",
+        data=json.dumps(body).encode(),
+        method="POST",
+    )
+    req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("Content-Type", "application/json")
+
+    with urllib.request.urlopen(req) as resp:
+        result = json.loads(resp.read())
+
+    points = []
+    for bucket in result.get("bucket", []):
+        for dataset in bucket.get("dataset", []):
+            points.extend(dataset.get("point", []))
+
+    if points:
+        return parse_sleep_data(points)
+
+    return round((end_ms - start_ms) / (1000 * 60 * 60), 1)
+
+def get_sleep_hours_by_day(access_token, start_time, end_time):
+    """Return sleep hours keyed by the UTC date when each sleep session ended."""
+    query_start = start_time - timedelta(hours=12)
+    query_end = end_time
+    start_ms = to_millis(start_time)
+    end_ms = to_millis(end_time)
+    sleep_by_day = {}
+
+    for session in list_sleep_sessions(access_token, query_start, query_end):
+        session_end_ms = int(session.get("endTimeMillis", 0))
+        if not start_ms <= session_end_ms <= end_ms:
+            continue
+
+        day = datetime.fromtimestamp(session_end_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        sleep_by_day[day] = sleep_by_day.get(day, 0) + aggregate_sleep_session(access_token, session)
+
+    return {day: round(hours, 1) for day, hours in sleep_by_day.items()}
+
+def get_sleep_hours(access_token, start_time, end_time):
+    """Return total sleep hours for sleep sessions ending in the interval."""
+    sleep_by_day = get_sleep_hours_by_day(access_token, start_time, end_time)
+    return round(sum(sleep_by_day.values()), 1)
 
 def get_daily_summary(access_token, date=None):
     """Get a full daily fitness summary for a specific date."""
@@ -113,7 +238,7 @@ def get_daily_summary(access_token, date=None):
     
     result = query_fitness_data(
         access_token, start, end,
-        ["steps", "heart_rate", "sleep", "active_minutes", "calories", "distance"]
+        ["steps", "heart_rate", "active_minutes", "calories", "distance"]
     )
     
     summary = {
@@ -146,12 +271,6 @@ def get_daily_summary(access_token, date=None):
                     summary["heart_rate_max"] = round(max(hr_values), 1)
                     summary["heart_rate_min"] = round(min(hr_values), 1)
             
-            elif "sleep" in data_type:
-                # Try to get sleep data from any source
-                sleep_hours = parse_sleep_data(points)
-                if sleep_hours > summary["sleep_hours"]:
-                    summary["sleep_hours"] = sleep_hours
-            
             elif "active_minutes" in data_type:
                 for point in points:
                     val = extract_value(point, "intVal")
@@ -170,6 +289,11 @@ def get_daily_summary(access_token, date=None):
                     if val:
                         summary["distance_meters"] += val
     
+    try:
+        summary["sleep_hours"] = get_sleep_hours(access_token, start, end)
+    except Exception as e:
+        summary["sleep_error"] = str(e)
+
     return summary
 
 def format_summary(summary):
@@ -185,6 +309,8 @@ def format_summary(summary):
     
     if summary["sleep_hours"]:
         lines.append(f"😴 Sleep: {summary['sleep_hours']}h")
+    elif summary.get("sleep_error"):
+        lines.append(f"Sleep: unavailable ({summary['sleep_error']})")
     
     if summary["active_minutes"]:
         lines.append(f"🔥 Active Minutes: {summary['active_minutes']}")
@@ -290,8 +416,9 @@ def format_summary(summary):
     
     lines.append("")
     lines.append("=" * 50)
-    
-    return "\n".join(lines)
+    if summary.get("sleep_error"):
+        lines.append("")
+        lines.append(f"Sleep unavailable: {summary['sleep_error']}")
     
     return "\n".join(lines)
 
@@ -302,7 +429,7 @@ def get_weekly_summary(access_token):
     
     result = query_fitness_data(
         access_token, start, end,
-        ["steps", "heart_rate", "sleep", "active_minutes", "calories"]
+        ["steps", "heart_rate", "active_minutes", "calories"]
     )
     
     daily = {}
@@ -323,9 +450,6 @@ def get_weekly_summary(access_token):
                     if val:
                         daily[day]["steps"] += val
             
-            elif "sleep" in data_type:
-                daily[day]["sleep_hours"] = parse_sleep_data(points)
-            
             elif "active_minutes" in data_type:
                 for point in points:
                     val = extract_value(point, "intVal")
@@ -338,6 +462,16 @@ def get_weekly_summary(access_token):
                     if val:
                         daily[day]["calories"] += val
     
+    try:
+        for day, sleep_hours in get_sleep_hours_by_day(access_token, start, end).items():
+            if day not in daily:
+                daily[day] = {"steps": 0, "sleep_hours": 0, "active_minutes": 0, "calories": 0}
+            daily[day]["sleep_hours"] = sleep_hours
+    except Exception as e:
+        sleep_error = str(e)
+    else:
+        sleep_error = None
+
     # Calculate averages
     days = len(daily)
     if days == 0:
@@ -355,6 +489,7 @@ def get_weekly_summary(access_token):
         "avg_active_minutes": round(avg_active),
         "avg_calories": round(avg_calories),
         "daily_breakdown": daily,
+        "sleep_error": sleep_error,
     }
 
 def format_weekly_summary(summary):
@@ -375,6 +510,10 @@ def format_weekly_summary(summary):
     
     for day, data in sorted(summary["daily_breakdown"].items()):
         lines.append(f"  {day}: {data['steps']:,} steps, {data['sleep_hours']}h sleep, {data['active_minutes']}m active")
+
+    if summary.get("sleep_error"):
+        lines.append("")
+        lines.append(f"Sleep unavailable: {summary['sleep_error']}")
     
     return "\n".join(lines)
 

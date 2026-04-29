@@ -5,9 +5,13 @@ Monitors specific card expenses using Google Pay/Wallet APIs.
 """
 
 import json
+import os
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
+from env_utils import load_dotenv
+
+load_dotenv()
 
 # Google Pay API endpoints (limited access)
 # Note: Full Wallet API requires special Google partnership
@@ -15,7 +19,7 @@ from pathlib import Path
 
 class WalletTracker:
     def __init__(self):
-        self.token_path = Path("/home/openclaw/.openclaw/workspace/.google_fit_tokens.json")
+        self.token_path = Path(os.environ.get("TOKEN_PATH", "credentials/google-fit-token.json"))
         self.transactions_file = Path("/home/openclaw/.openclaw/workspace/data/transactions.json")
         self.transactions_file.parent.mkdir(parents=True, exist_ok=True)
     
